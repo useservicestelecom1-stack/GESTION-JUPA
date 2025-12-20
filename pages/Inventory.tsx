@@ -1,7 +1,7 @@
 
 import React, { useState, useMemo } from 'react';
 import { AppState, InventoryItem, PurchaseOrder, PurchaseStatus, SystemUser, UserRole, Transaction, TransactionType, TransactionCategory, MaintenanceLog } from '../types';
-import { Archive, Plus, ClipboardList, ShoppingCart, CheckCircle, Clock, AlertCircle, Trash2, Pencil, X, DollarSign, Loader, List, Search, PackagePlus, ChevronDown, ChevronUp, User, Send, PackageCheck, CreditCard, Terminal, ShieldAlert, Package, Calendar, Beaker, TestTube, Save, Settings2, Info, Target, Truck } from 'lucide-react';
+import { Archive, Plus, ClipboardList, ShoppingCart, CheckCircle, Clock, AlertCircle, Trash2, Pencil, X, DollarSign, Loader, List, Search, PackagePlus, ChevronDown, ChevronUp, User, Send, PackageCheck, CreditCard, Terminal, ShieldAlert, Package, Calendar, Beaker, TestTube, Save, Settings2, Info, Target, Truck, Minus, ArrowRight } from 'lucide-react';
 import { db } from '../services/dataService';
 
 interface InventoryProps {
@@ -13,7 +13,6 @@ interface InventoryProps {
 const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }) => {
   const [activeTab, setActiveTab] = useState<'CHEMICAL_CONTROL' | 'PURCHASE_ORDERS' | 'CATALOG' | 'STOCK'>('CHEMICAL_CONTROL');
   const [searchTerm, setSearchTerm] = useState('');
-  const [expandedOrderId, setExpandedOrderId] = useState<string | null>(null);
   
   const isAdmin = currentUser?.role === UserRole.ADMIN;
   const canManage = isAdmin || currentUser?.role === UserRole.EDITOR;
@@ -32,7 +31,6 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
   const POOL_VOLUME_GAL = 610000;
   const POOL_VOLUME_M3 = 2309.1; 
   
-  // Lecturas actuales vs Metas
   const [readings, setReadings] = useState({ 
     ph: 7.8, 
     chlorine: 1.0, 
@@ -42,11 +40,10 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
     targetAlkalinity: 100
   });
 
-  // Configuración de pureza de productos (Permite cambio de concentración para el cálculo)
   const [chemConfig, setChemConfig] = useState({ 
-    chlorinePurity: 65,    // % Cloro activo
-    phDownPurity: 93,      // % Concentración del reductor (estándar 93%)
-    alkalinityPurity: 100  // % Pureza del incrementador
+    chlorinePurity: 65,
+    phDownPurity: 93,
+    alkalinityPurity: 100
   });
 
   const [productMapping, setProductMapping] = useState({
@@ -55,21 +52,18 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
       alkalinityItemId: appState.inventory.find(i => i.name.toLowerCase().includes('alcalinidad') || i.name.toLowerCase().includes('bicarbonato'))?.id || ''
   });
 
-  // --- CÁLCULOS QUÍMICOS DINÁMICOS (LBS) ---
+  // --- ESTADOS DESCARGA MANUAL ---
+  const [manualUsageItems, setManualUsageItems] = useState<{ itemId: string; amount: number }[]>([]);
+  const [currentManualItem, setCurrentManualItem] = useState({ itemId: '', amount: 0 });
+
   const dosages = useMemo(() => {
       const factorVol10k = POOL_VOLUME_GAL / 10000;
-
-      // 1. CLORO: 2oz (0.125 lb) de Cloro 65% sube 1ppm en 10k gal
       const chlorineDiff = Math.max(0, readings.targetChlorine - readings.chlorine);
       const baseClLbsPerPpm = 2 / 16; 
       const chlorineNeededLbs = chlorineDiff * baseClLbsPerPpm * factorVol10k * (65 / chemConfig.chlorinePurity);
-
-      // 2. PH (REDUCTOR): 1 lb de producto al 93% baja 0.2 unidades en 10k gal
       const phDownDiff = Math.max(0, readings.ph - readings.targetPh);
       const basePhDownLbsPer02 = 1.0; 
       const phDownNeededLbs = (phDownDiff / 0.2) * basePhDownLbsPer02 * factorVol10k * (93 / chemConfig.phDownPurity);
-
-      // 3. ALCALINIDAD: 1kg (2.20462 lbs) / 50m3 sube 10ppm
       const alkDiff = Math.max(0, readings.targetAlkalinity - readings.alkalinity);
       const factorAlkM3 = POOL_VOLUME_M3 / 50;
       const alkNeededLbs = (alkDiff / 10) * factorAlkM3 * 2.20462 * (100 / chemConfig.alkalinityPurity);
@@ -81,62 +75,63 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
       };
   }, [readings, chemConfig]);
 
-  // Monitor de procesos visual
   const [processStatus, setProcessStatus] = useState<{
       steps: { id: string; label: string; status: 'pending' | 'loading' | 'success' | 'error'; error?: string }[];
       isVisible: boolean;
       isDone: boolean;
   }>({ isVisible: false, isDone: false, steps: [] });
 
-  // --- GESTIÓN DE COMPRAS (RESTAURADO) ---
-  const [newPurchase, setNewPurchase] = useState<Partial<PurchaseOrder>>({ 
-    supplierId: '', 
-    date: new Date().toISOString().split('T')[0], 
-    items: [], 
-    totalAmount: 0 
-  });
-  const [pItem, setPItem] = useState({ id: '', name: '', qty: 1, price: 0 });
+  const updateStep = (id: string, status: any, error?: string) => {
+      setProcessStatus(prev => ({ ...prev, steps: prev.steps.map(s => s.id === id ? { ...s, status, error } : s) }));
+  };
 
-  const handleApplyMaintenance = async () => {
+  const handleApplyMaintenance = async (isManual: boolean = false) => {
       if (!canManage) return;
       setIsSaving(true);
       const steps = [
           { id: 'check', label: 'Validando stock disponible (lb)', status: 'pending' },
-          { id: 'deduct', label: 'Actualizando inventario', status: 'pending' },
+          { id: 'deduct', label: 'Actualizando inventario físico', status: 'pending' },
           { id: 'log', label: 'Registrando en bitácora operativa', status: 'pending' }
       ];
       setProcessStatus({ isVisible: true, isDone: false, steps: steps as any });
 
-      const updateStep = (id: string, status: any, error?: string) => {
-          setProcessStatus(prev => ({ ...prev, steps: prev.steps.map(s => s.id === id ? { ...s, status, error } : s) }));
-      };
-
       try {
           updateStep('check', 'loading');
-          const itemsToProcess = [
-              { id: productMapping.chlorineItemId, amount: dosages.chlorine, label: 'Cloro' },
-              { id: productMapping.phDownItemId, amount: dosages.phDown, label: 'Reductor pH' },
-              { id: productMapping.alkalinityItemId, amount: dosages.alkalinity, label: 'Alcalinidad' }
-          ].filter(item => item.amount > 0);
-
-          if (itemsToProcess.length === 0) throw new Error("No hay químicos por aplicar según los niveles actuales.");
+          
+          let itemsToProcess: { id: string; amount: number; label: string }[] = [];
+          
+          if (isManual) {
+              if (manualUsageItems.length === 0) throw new Error("Debe añadir al menos un insumo a la lista manual.");
+              itemsToProcess = manualUsageItems.map(item => {
+                  const inv = appState.inventory.find(i => i.id === item.itemId);
+                  return { id: item.itemId, amount: item.amount, label: inv?.name || 'Producto' };
+              });
+          } else {
+              itemsToProcess = [
+                  { id: productMapping.chlorineItemId, amount: dosages.chlorine, label: 'Cloro' },
+                  { id: productMapping.phDownItemId, amount: dosages.phDown, label: 'Reductor pH' },
+                  { id: productMapping.alkalinityItemId, amount: dosages.alkalinity, label: 'Alcalinidad' }
+              ].filter(item => item.amount > 0);
+              
+              if (itemsToProcess.length === 0) throw new Error("No hay químicos por aplicar según los niveles actuales.");
+          }
 
           for (const check of itemsToProcess) {
               const invItem = appState.inventory.find(i => i.id === check.id);
-              if (!invItem) throw new Error(`Mapee el producto en 'Config. Pureza' para ${check.label}`);
+              if (!invItem) throw new Error(`El producto ${check.label} no está vinculado correctamente.`);
               if (invItem.quantity < check.amount) throw new Error(`Stock insuficiente de ${invItem.name}. Requerido: ${check.amount} lb.`);
           }
           updateStep('check', 'success');
 
           updateStep('deduct', 'loading');
           const currentInv = [...appState.inventory];
-          const itemsUsed = [];
+          const itemsUsedLog = [];
           for (const itemOp of itemsToProcess) {
               const idx = currentInv.findIndex(i => i.id === itemOp.id);
               const updated = { ...currentInv[idx], quantity: Number((currentInv[idx].quantity - itemOp.amount).toFixed(2)) };
               await db.inventory.upsert(updated);
               currentInv[idx] = updated;
-              itemsUsed.push({ itemId: itemOp.id, itemName: updated.name, amountUsed: itemOp.amount });
+              itemsUsedLog.push({ itemId: itemOp.id, itemName: updated.name, amountUsed: itemOp.amount });
           }
           updateStep('deduct', 'success');
 
@@ -144,13 +139,16 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
           const newLog: MaintenanceLog = {
               id: `mnt-${Date.now()}`, date: new Date().toISOString().split('T')[0],
               performedBy: currentUser?.fullName || 'Operador',
-              description: `Ajuste Químico (610k gal)`,
-              itemsUsed, phReading: readings.ph, chlorineReading: readings.chlorine, alkalinityReading: readings.alkalinity,
-              notes: `pH: ${readings.ph} -> ${readings.targetPh}. Reductor (${chemConfig.phDownPurity}%): ${dosages.phDown} lb.`
+              description: isManual ? `Descarga Manual de Insumos` : `Ajuste Químico Sugerido (610k gal)`,
+              itemsUsed: itemsUsedLog, 
+              phReading: readings.ph, chlorineReading: readings.chlorine, alkalinityReading: readings.alkalinity,
+              notes: isManual ? 'Despacho manual de productos para mantenimiento correctivo.' : `pH: ${readings.ph} -> ${readings.targetPh}. Sugerencia aplicada.`
           };
           await db.maintenanceLogs.upsert(newLog);
           onUpdate({ ...appState, inventory: currentInv, maintenanceLogs: [newLog, ...appState.maintenanceLogs] });
           updateStep('log', 'success');
+          
+          if (isManual) setManualUsageItems([]);
           setProcessStatus(prev => ({ ...prev, isDone: true }));
       } catch (e: any) {
           updateStep('check', 'error', e.message);
@@ -163,6 +161,9 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
       return item ? `${item.quantity} ${item.unit}` : '0 lb';
   };
 
+  // --- GESTIÓN DE COMPRAS ---
+  const [newPurchase, setNewPurchase] = useState<Partial<PurchaseOrder>>({ supplierId: '', date: new Date().toISOString().split('T')[0], items: [], totalAmount: 0 });
+  const [pItem, setPItem] = useState({ id: '', name: '', qty: 1, price: 0 });
   const [newItem, setNewItem] = useState<Partial<InventoryItem>>({ name: '', unit: 'lb', quantity: 0, unitCost: 0, minThreshold: 5 });
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
 
@@ -172,8 +173,8 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
     <div className="space-y-6">
        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col md:flex-row md:items-center justify-between gap-6">
          <div>
-            <h2 className="text-3xl font-bold text-slate-800 tracking-tight">Operaciones e Inventario</h2>
-            <p className="text-slate-500 text-sm">Ingeniería química en Libras (lb) para 610,000 galones.</p>
+            <h2 className="text-3xl font-bold text-slate-800 tracking-tight">Operaciones de Agua</h2>
+            <p className="text-slate-500 text-sm">Gestión química integral para 610,000 galones.</p>
          </div>
          {canManage && (
             <div className="flex gap-2">
@@ -265,13 +266,14 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
                </div>
 
                <div className="lg:col-span-3 space-y-6">
+                   {/* MODULO 1: CALCULO AUTOMATICO */}
                    <div className="bg-slate-900 text-white p-8 rounded-[2.5rem] shadow-2xl relative overflow-hidden">
                        <div className="absolute top-0 right-0 p-8 opacity-5"><Beaker size={150} /></div>
                        <div className="relative z-10">
                            <div className="flex items-center justify-between mb-8 border-b border-white/10 pb-4">
                                 <h3 className="text-teal-400 font-black tracking-widest text-sm uppercase">Cálculo de Dosificación Automático</h3>
                                 <div className="bg-blue-600/20 text-blue-400 px-4 py-2 rounded-xl text-[10px] font-black flex items-center gap-2 uppercase">
-                                    <Info size={14}/> Protocolo: Alcalinidad → pH (Esperar 24h) → Cloro
+                                    <Info size={14}/> Basado en lecturas y metas
                                 </div>
                            </div>
                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
@@ -301,15 +303,114 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
                                 </div>
                            </div>
                            <div className="flex justify-end">
-                               <button onClick={handleApplyMaintenance} disabled={isSaving || (dosages.chlorine === 0 && dosages.phDown === 0 && dosages.alkalinity === 0)} className="bg-teal-500 hover:bg-teal-400 text-slate-900 font-black px-12 py-5 rounded-2xl shadow-xl transition-all transform hover:scale-105 active:scale-95 flex items-center gap-3 uppercase tracking-widest text-sm">
-                                   <Save size={24} /> Registrar Aplicación y Descontar Stock
+                               <button onClick={() => handleApplyMaintenance(false)} disabled={isSaving || (dosages.chlorine === 0 && dosages.phDown === 0 && dosages.alkalinity === 0)} className="bg-teal-500 hover:bg-teal-400 text-slate-900 font-black px-12 py-5 rounded-2xl shadow-xl transition-all transform hover:scale-105 active:scale-95 flex items-center gap-3 uppercase tracking-widest text-sm">
+                                   <Save size={24} /> Aplicar Sugerencia Automática
                                </button>
                            </div>
                        </div>
                    </div>
+
+                   {/* MODULO 2: DESCARGA MANUAL DE INSUMOS */}
+                   <div className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-100">
+                        <div className="flex items-center justify-between mb-8 border-b border-slate-50 pb-4">
+                            <div>
+                                <h3 className="text-slate-800 font-black tracking-widest text-sm uppercase flex items-center gap-2">
+                                    <Minus className="text-red-500" size={20} /> Descarga Manual de Insumos
+                                </h3>
+                                <p className="text-[10px] text-slate-400 font-bold uppercase mt-1">Uso correctivo o mantenimiento adicional</p>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end mb-8 bg-slate-50 p-6 rounded-3xl border border-slate-100">
+                            <div className="md:col-span-6">
+                                <label className="block text-[10px] font-black text-slate-400 uppercase mb-2">Seleccionar Insumo del Inventario</label>
+                                <select 
+                                    className="w-full border-2 border-white bg-white p-3.5 rounded-2xl font-bold text-slate-700 shadow-sm outline-none"
+                                    value={currentManualItem.itemId}
+                                    onChange={e => setCurrentManualItem({ ...currentManualItem, itemId: e.target.value })}
+                                >
+                                    <option value="">-- Seleccionar producto --</option>
+                                    {appState.inventory.map(i => (
+                                        <option key={i.id} value={i.id}>{i.name} (Disp: {i.quantity} lb)</option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div className="md:col-span-4">
+                                <label className="block text-[10px] font-black text-slate-400 uppercase mb-2">Cantidad a Retirar (lb)</label>
+                                <input 
+                                    type="number" 
+                                    step="0.01"
+                                    className="w-full border-2 border-white bg-white p-3.5 rounded-2xl font-black text-slate-700 shadow-sm outline-none"
+                                    value={currentManualItem.amount}
+                                    onChange={e => setCurrentManualItem({ ...currentManualItem, amount: Number(e.target.value) })}
+                                />
+                            </div>
+                            <div className="md:col-span-2">
+                                <button 
+                                    onClick={() => {
+                                        if (!currentManualItem.itemId || currentManualItem.amount <= 0) return;
+                                        setManualUsageItems([...manualUsageItems, currentManualItem]);
+                                        setCurrentManualItem({ itemId: '', amount: 0 });
+                                    }}
+                                    className="w-full bg-slate-800 text-white p-4 rounded-2xl font-black hover:bg-black transition-all shadow-lg active:scale-95"
+                                >
+                                    Añadir
+                                </button>
+                            </div>
+                        </div>
+
+                        {manualUsageItems.length > 0 && (
+                            <div className="space-y-3 mb-8">
+                                <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest pl-2">Lista de Despacho</h4>
+                                {manualUsageItems.map((item, idx) => {
+                                    const inv = appState.inventory.find(i => i.id === item.itemId);
+                                    return (
+                                        <div key={idx} className="flex items-center justify-between bg-white border border-slate-100 p-4 rounded-2xl shadow-sm">
+                                            <div className="flex items-center gap-3">
+                                                <div className="w-10 h-10 bg-slate-50 rounded-xl flex items-center justify-center text-slate-400">
+                                                    <Package size={20} />
+                                                </div>
+                                                <div>
+                                                    <p className="font-black text-slate-800 text-sm">{inv?.name}</p>
+                                                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter">Inventario Físico</p>
+                                                </div>
+                                            </div>
+                                            <div className="flex items-center gap-6">
+                                                <div className="text-right">
+                                                    <p className="text-lg font-black text-red-600">-{item.amount} <span className="text-xs">lb</span></p>
+                                                    <p className="text-[9px] text-slate-400 font-bold uppercase">Consumo Manual</p>
+                                                </div>
+                                                <button 
+                                                    onClick={() => setManualUsageItems(manualUsageItems.filter((_, i) => i !== idx))}
+                                                    className="p-2 text-slate-300 hover:text-red-500 transition-colors"
+                                                >
+                                                    <Trash2 size={20} />
+                                                </button>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                                <div className="flex justify-end pt-4">
+                                    <button 
+                                        onClick={() => handleApplyMaintenance(true)}
+                                        disabled={isSaving}
+                                        className="bg-red-600 hover:bg-red-700 text-white font-black px-10 py-5 rounded-2xl shadow-xl transition-all transform hover:scale-105 active:scale-95 flex items-center gap-3 uppercase tracking-widest text-sm"
+                                    >
+                                        <ArrowRight size={24} /> Procesar Salida de Almacén
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                   </div>
+
+                   {/* HISTORIAL */}
                    <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-                        <div className="p-5 bg-slate-50 border-b font-black text-slate-700 flex items-center gap-2 text-xs uppercase tracking-widest"><ClipboardList size={20} className="text-teal-600"/> Historial de Mantenimiento Químico</div>
-                        <div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className="bg-slate-100 text-slate-500 text-[10px] font-black uppercase"><tr><th className="p-4">Fecha</th><th className="p-4">Análisis</th><th className="p-4">Aplicación</th><th className="p-4">Operador</th></tr></thead><tbody className="divide-y divide-slate-100">{appState.maintenanceLogs.map(log => (<tr key={log.id} className="hover:bg-slate-50"><td className="p-4 font-bold text-slate-600">{log.date}</td><td className="p-4"><div className="flex flex-wrap gap-1"><span className="bg-orange-50 text-orange-700 px-2 py-0.5 rounded text-[9px] font-bold">pH: {log.phReading || '-'}</span><span className="bg-teal-50 text-teal-700 px-2 py-0.5 rounded text-[9px] font-bold">Cl: {log.chlorineReading || '-'}</span><span className="bg-blue-50 text-blue-700 px-2 py-0.5 rounded text-[9px] font-bold">Alc: {log.alkalinityReading || '-'}</span></div></td><td className="p-4"><div className="flex flex-wrap gap-1">{log.itemsUsed.map((it, idx) => (<span key={idx} className="bg-slate-100 text-slate-500 px-2 py-0.5 rounded text-[9px] font-medium">{it.itemName}: {it.amountUsed} lb</span>))}</div></td><td className="p-4 text-slate-600 font-medium">{log.performedBy}</td></tr>))}</tbody></table></div>
+                        <div className="p-5 bg-slate-50 border-b font-black text-slate-700 flex items-center justify-between">
+                            <div className="flex items-center gap-2 text-xs uppercase tracking-widest">
+                                <ClipboardList size={20} className="text-teal-600"/> Historial Operativo
+                            </div>
+                        </div>
+                        <div className="overflow-x-auto"><table className="w-full text-left text-sm"><thead className="bg-slate-100 text-slate-500 text-[10px] font-black uppercase"><tr><th className="p-4">Fecha</th><th className="p-4">Tipo Procedimiento</th><th className="p-4">Insumos Despachados</th><th className="p-4">Operador</th></tr></thead><tbody className="divide-y divide-slate-100">{appState.maintenanceLogs.map(log => (<tr key={log.id} className="hover:bg-slate-50"><td className="p-4 font-bold text-slate-600">{log.date}</td><td className="p-4"><span className={`px-2 py-1 rounded text-[9px] font-black uppercase tracking-tighter border ${log.description.includes('Manual') ? 'bg-orange-50 text-orange-600 border-orange-100' : 'bg-teal-50 text-teal-600 border-teal-100'}`}>{log.description}</span></td><td className="p-4"><div className="flex flex-wrap gap-1">{log.itemsUsed.map((it, idx) => (<span key={idx} className="bg-slate-100 text-slate-500 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-tighter">{it.itemName}: {it.amountUsed} lb</span>))}</div></td><td className="p-4 text-slate-600 font-black text-xs">{log.performedBy}</td></tr>))}</tbody></table></div>
                     </div>
                </div>
            </div>
@@ -384,7 +485,7 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
          </div>
        )}
 
-       {/* --- MODAL GENERAR COMPRA --- */}
+       {/* MODAL GENERAR COMPRA */}
        {showPurchaseModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-md flex items-center justify-center z-[110] p-4">
             <div className="bg-white rounded-[2.5rem] w-full max-w-3xl p-10 shadow-2xl overflow-y-auto max-h-[95vh] animate-in zoom-in-95">
@@ -443,7 +544,7 @@ const Inventory: React.FC<InventoryProps> = ({ appState, onUpdate, currentUser }
         </div>
        )}
 
-       {/* --- MODAL RECEPCIÓN PEDIDO --- */}
+       {/* MODAL RECEPCIÓN PEDIDO */}
        {receiveConfirmModal.isOpen && receiveConfirmModal.order && (
           <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[200] p-4 backdrop-blur-md">
               <div className="bg-white rounded-[2.5rem] w-full max-w-md p-10 shadow-2xl">
